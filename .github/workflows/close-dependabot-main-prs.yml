@@ -1,0 +1,175 @@
+name: Copy Dependabot PRs from Main to Dev
+# Dependabot can sometimes open PRs for main. This violates the team's SDLC.
+# This workflow detects, copies & closes a Dependabot PR opened for main.
+
+# Trigger workflow for PRs where:
+# (branch is main) AND (type is opened OR reopened)
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+
+permissions:
+  contents: write          # Create the copy branch
+  issues: write            # Create copy PR, close original PR 
+  pull-requests: write     # Add labels to copy PR, comment original PR
+
+# Serialize workflow runs for each original PR number
+concurrency:
+  group: dependabot-main-to-dev-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  copy-dependabot-main-pr:
+    # Copy PR only if:
+    # (author is Dependabot) AND (branch is main)
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      # Do not check out or execute PR code for security
+      - name: Copy PR to dev and close the original
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          TARGET_BRANCH: dev
+        run: |
+          set -euo pipefail
+          
+          # Get og pr metadata
+          pr_json="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"
+          pr_title="$(jq -r '.title' <<<"${pr_json}")"
+          pr_body="$(jq -r '.body // ""' <<<"${pr_json}")"
+          pr_url="$(jq -r '.html_url' <<<"${pr_json}")"
+          pr_state="$(jq -r '.state' <<<"${pr_json}")"
+          original_base="$(jq -r '.base.ref' <<<"${pr_json}")"
+          original_head="$(jq -r '.head.ref' <<<"${pr_json}")"
+          original_head_label="$(jq -r '.head.label // .head.ref' <<<"${pr_json}")"
+          original_head_repo="$(jq -r '.head.repo.full_name // "unknown"' <<<"${pr_json}")"
+          original_head_sha="$(jq -r '.head.sha' <<<"${pr_json}")"
+          original_labels="$(jq -r '[.labels[].name] | if length == 0 then "(none)" else join(", ") end' <<<"${pr_json}")"
+
+          # Double check author, target branch & state
+          if [[ "${PR_AUTHOR}" != "dependabot[bot]" || "${PR_BASE}" != "main" || "${original_base}" != "main" ]]; then
+            echo "The PR no longer matches the Dependabot-to-dev routing criteria. Leaving it unchanged."
+            exit 0
+          fi
+          if [[ "${pr_state}" != "open" ]]; then
+            echo "PR #${PR_NUMBER} is ${pr_state}; leaving it unchanged."
+            exit 0
+          fi
+
+          # Don't use Dependabot branch name bc it gets deleted when the PR is closed
+          copy_branch="dependabot-to-dev/pr-${PR_NUMBER}"
+          repo_owner="${REPO%%/*}"
+
+          # If you reuse an existing copy branch make sure it's SHA head
+          # is the same as the original branch to prevent overwriting
+          existing_copy_sha="$(gh api "repos/${REPO}/git/ref/heads/${copy_branch}" --jq '.object.sha' 2>/dev/null || true)"
+          if [[ -n "${existing_copy_sha}" ]]; then
+            if [[ "${existing_copy_sha}" != "${original_head_sha}" ]]; then
+              echo "${copy_branch} already exists at ${existing_copy_sha}, not ${original_head_sha}."
+              echo "Refusing to overwrite an existing branch."
+              exit 1
+            fi
+          else
+            # Create the copy branch pointing to original's SHA head
+            gh api --method POST "repos/${REPO}/git/refs" \
+              -f "ref=refs/heads/${copy_branch}" \
+              -f "sha=${original_head_sha}" \
+              >/dev/null
+          fi
+
+          # Make copy PR's description
+          copy_title="[Dependabot to dev] ${pr_title}"
+          copy_title="${copy_title:0:256}"
+          transfer_marker="<!-- dependabot-main-to-dev:${PR_NUMBER} -->"
+          copy_body="$(printf '%s\n' \
+            "${transfer_marker}" \
+            "# Dependabot PR copied from [PR #${PR_NUMBER}](<${pr_url}>)" \
+            "" \
+            "This PR preserves the exact head commit from the original Dependabot PR while routing the change through \`${TARGET_BRANCH}\`. Conflicts with \`${TARGET_BRANCH}\` are expected and can be resolved during review." \
+            "" \
+            "## Original PR metadata" \
+            "" \
+            "- Original PR: [#${PR_NUMBER}](<${pr_url}>)" \
+            "- Original title: ${pr_title}" \
+            "- Original state when copied: ${pr_state}" \
+            "- Original base branch: \`${original_base}\`" \
+            "- Original head branch: \`${original_head}\`" \
+            "- Original head label: \`${original_head_label}\`" \
+            "- Original head repository: \`${original_head_repo}\`" \
+            "- Original head SHA: \`${original_head_sha}\`" \
+            "- Original labels: ${original_labels}" \
+            "- Copy branch: \`${copy_branch}\`" \
+            "- Copy base branch: \`${TARGET_BRANCH}\`" \
+            "" \
+            "## Original PR description" \
+            "" \
+            "${pr_body:-_No description was supplied._}" \
+            "" \
+            "---" \
+            "" \
+            "This copy was created automatically because this repository merges dependency changes into \`${TARGET_BRANCH}\` before they reach \`main\`. The original PR will be closed after this copy is available for review.")"
+
+          # If a copy PR already exists, reuse it
+          copy_pr_number="$(gh api --method GET "repos/${REPO}/pulls" \
+            -f state=open \
+            -f head="${repo_owner}:${copy_branch}" \
+            -f base="${TARGET_BRANCH}" \
+            -f per_page=100 \
+            --jq '.[0].number // empty')"
+
+          # Create a copy PR if it doesn't exist
+          if [[ -z "${copy_pr_number}" ]]; then
+            copy_pr_json="$(printf '%s' "${copy_body}" | jq -Rs --arg title "${copy_title}" --arg head "${copy_branch}" --arg base "${TARGET_BRANCH}" '{title: $title, head: $head, base: $base, body: ., maintainer_can_modify: false}' | gh api --method POST "repos/${REPO}/pulls" --input -)"
+            copy_pr_number="$(jq -r '.number' <<<"${copy_pr_json}")"
+            copy_pr_url="$(jq -r '.html_url' <<<"${copy_pr_json}")"
+          else
+            # Reuse the existing copy PR
+            copy_pr_url="$(gh api "repos/${REPO}/pulls/${copy_pr_number}" --jq '.html_url')"
+          fi
+
+          # Double check copy PR targets dev & it's copy branch points to the original branch's SHA
+          copy_pr_base="$(gh api "repos/${REPO}/pulls/${copy_pr_number}" --jq '.base.ref')"
+          copy_pr_head_sha="$(gh api "repos/${REPO}/pulls/${copy_pr_number}" --jq '.head.sha')"
+          if [[ "${copy_pr_base}" != "${TARGET_BRANCH}" || "${copy_pr_head_sha}" != "${original_head_sha}" ]]; then
+            echo "The copy PR does not target ${TARGET_BRANCH} at the original head SHA."
+            exit 1
+          fi
+
+          # Preserve the original labels as actual labels when they exist.
+          # The description above remains the authoritative metadata snapshot.
+          labels_json="$(jq -c '[.labels[].name]' <<<"${pr_json}")"
+          if [[ "${labels_json}" != "[]" ]]; then
+            jq -n --argjson labels "${labels_json}" '{labels: $labels}' \
+              | gh api --method POST "repos/${REPO}/issues/${copy_pr_number}/labels" --input - \
+              >/dev/null
+          fi
+
+          # Comment the copy PR
+          transfer_comment="${transfer_marker}
+          This Dependabot PR targeted \`main\`, so it was copied to [PR #${copy_pr_number}](<${copy_pr_url}>) targeting \`${TARGET_BRANCH}\`.
+
+          The copy uses the original head SHA \`${original_head_sha}\` and includes the original PR and branch metadata in its description. The original PR is being closed to keep dependency changes flowing through \`${TARGET_BRANCH}\` first."
+
+          marker_found="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" --jq '.[].body' \
+            | awk -v marker="${transfer_marker}" 'index($0, marker) { found = 1 } END { print found ? "yes" : "no" }')"
+          if [[ "${marker_found}" != "yes" ]]; then
+            gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f "body=${transfer_comment}" \
+              >/dev/null
+          fi
+
+          # Close the original PR
+          gh api --method PATCH "repos/${REPO}/pulls/${PR_NUMBER}" \
+            -f state=closed \
+            >/dev/null
+
+          echo "Created or reused ${copy_pr_url} and closed ${pr_url}."
