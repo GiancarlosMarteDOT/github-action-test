@@ -71,7 +71,11 @@ jobs:
 
           # If you reuse an existing copy branch make sure it's SHA head
           # is the same as the original branch to prevent overwriting
-          existing_copy_sha="$(gh api "repos/${REPO}/git/ref/heads/${copy_branch}" --jq '.object.sha' 2>/dev/null || true)"
+          existing_copy_sha="$(
+            gh api "repos/${REPO}/git/ref/heads/${copy_branch}" 2>/dev/null \
+              | jq -r '.object.sha // empty' \
+              || true
+          )"
           if [[ -n "${existing_copy_sha}" ]]; then
             if [[ "${existing_copy_sha}" != "${original_head_sha}" ]]; then
               echo "${copy_branch} already exists at ${existing_copy_sha}, not ${original_head_sha}."
